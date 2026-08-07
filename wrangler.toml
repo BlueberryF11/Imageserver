@@ -2,26 +2,16 @@ name = "imageserver-worker"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-[env.production]
-name = "imageserver-worker-prod"
-routes = [
-  { pattern = "imageserver.yourdomain.com/*", zone_name = "yourdomain.com" }
-]
-
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "blueberry-images"
-jurisdiction = "eu"
 
 [[r2_buckets]]
 binding = "METADATA"
 bucket_name = "blueberry-metadata"
-jurisdiction = "eu"
 
-[build]
-command = "npm install"
-cwd = "./"
-
-[build.upload]
-format = "modules"
-main = "./src/index.js"
+[env.production]
+name = "imageserver-worker-prod"
+routes = [
+  { pattern = "images.yourdomain.com/*", zone_name = "yourdomain.com" }
+]
