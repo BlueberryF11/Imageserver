@@ -1,0 +1,18 @@
+{
+  "name": "imageserver-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for Blueberry Fruitsy image server with auto-generating collections.json",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node --test src/index.test.js"
+  },
+  "dependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "devDependencies": {
+    "miniflare": "^3.0.0"
+  }
+}
