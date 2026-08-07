@@ -267,6 +267,8 @@ async function handleIndex(env) {
         .api-doc { background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 8px; padding: 20px; margin: 20px 0; }
         .endpoint { background: rgba(0,0,0,0.3); padding: 15px; border-radius: 6px; margin: 10px 0; font-family: monospace; border-left: 3px solid #3b82f6; }
         code { background: rgba(0,0,0,0.2); padding: 2px 6px; border-radius: 3px; color: #60a5fa; }
+        ul { margin-left: 20px; }
+        footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid rgba(59,130,246,0.2); color: #707070; }
     </style>
 </head>
 <body>
@@ -308,20 +310,7 @@ async function handleIndex(env) {
             </ul>
         </div>
 
-        <div class="api-doc">
-            <h2>📁 Folder Structure</h2>
-            <pre>R2 Bucket: blueberry-images/
-├── collections/
-│   ├── digital-art/
-│   │   ├── image1.jpg
-│   │   └── image2.png
-│   ├── photography/
-│   │   └── photo1.jpg
-│   └── music-visuals/
-│       └── visual1.webp</pre>
-        </div>
-
-        <footer style="margin-top: 60px; padding-top: 20px; border-top: 1px solid rgba(59,130,246,0.2); color: #707070;">
+        <footer>
             <p>Made with 💙 by BlueberryF11</p>
         </footer>
     </div>
