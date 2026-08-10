@@ -8,47 +8,41 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return corsResponse('OK');
     }
 
-    // GET /collections.json - Return auto-generated metadata
+    // Browser upload dashboard
+    if (path === '/admin' || path === '/upload.html') {
+      return handleAdminPage();
+    }
+
     if (path === '/collections.json') {
       return handleGetCollections(env);
     }
 
-    // GET /collections/[name]/* - Serve images from R2
     if (path.startsWith('/collections/')) {
       return handleGetImage(path, env);
     }
 
-    // POST /upload - Upload image (requires auth token)
     if (path === '/upload' && request.method === 'POST') {
       return handleUpload(request, env);
     }
 
-    // GET / - Return sitemap/info page
     if (path === '/') {
-      return handleIndex(env);
+      return handleIndex();
     }
 
     return new Response('Not found', { status: 404 });
   },
 
   async scheduled(event, env, ctx) {
-    // Regenerate collections.json every hour
     await regenerateCollectionsJson(env);
   },
 };
 
-/**
- * GET /collections.json
- * Scans R2 bucket and returns auto-generated metadata
- */
 async function handleGetCollections(env) {
   try {
-    // Try to get cached version first
     const cached = await env.METADATA.get('collections.json');
     if (cached) {
       return corsResponse(cached.body, {
@@ -59,10 +53,7 @@ async function handleGetCollections(env) {
       });
     }
 
-    // Generate fresh collections.json
     const collections = await generateCollectionsJson(env);
-    
-    // Cache it for 1 hour
     await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), {
       metadata: { generated: new Date().toISOString() },
     });
@@ -79,63 +70,63 @@ async function handleGetCollections(env) {
   }
 }
 
-/**
- * Generate collections.json by scanning R2 bucket
- */
 async function generateCollectionsJson(env) {
   const collections = [];
   const collectionMap = new Map();
+  let cursor;
 
-  // List all objects in R2 bucket
-  const listResponse = await env.IMAGES.list();
+  // List every object in R2, including buckets with more than 1,000 objects.
+  do {
+    const listResponse = await env.IMAGES.list({ cursor });
 
-  // Group images by collection folder
-  for (const object of listResponse.objects) {
-    const pathParts = object.key.split('/');
-    
-    if (pathParts.length >= 3 && pathParts[0] === 'collections') {
-      const collectionName = pathParts[1];
-      const filename = pathParts[pathParts.length - 1];
+    for (const object of listResponse.objects) {
+      const pathParts = object.key.split('/');
+      if (pathParts.length >= 3 && pathParts[0] === 'collections') {
+        const collectionName = pathParts[1];
+        const filename = pathParts[pathParts.length - 1];
 
-      // Skip non-image files and directories
-      if (!isImageFile(filename) || filename.startsWith('.')) continue;
+        if (!isImageFile(filename) || filename.startsWith('.')) continue;
 
-      if (!collectionMap.has(collectionName)) {
-        collectionMap.set(collectionName, {
-          name: formatCollectionName(collectionName),
-          description: `Collection: ${formatCollectionName(collectionName)}`,
-          path: `collections/${collectionName}`,
-          images: [],
+        if (!collectionMap.has(collectionName)) {
+          collectionMap.set(collectionName, {
+            name: formatCollectionName(collectionName),
+            description: `Collection: ${formatCollectionName(collectionName)}`,
+            path: `collections/${collectionName}`,
+            images: [],
+          });
+        }
+
+        const collection = collectionMap.get(collectionName);
+        collection.images.push({
+          id: collection.images.length + 1,
+          filename,
+          title: formatTitle(filename),
+          url: `/collections/${collectionName}/${filename}`,
+          uploaded: object.uploaded.toISOString(),
+          size: object.size,
         });
       }
-
-      const collection = collectionMap.get(collectionName);
-      collection.images.push({
-        id: collection.images.length + 1,
-        filename: filename,
-        title: formatTitle(filename),
-        url: `/collections/${collectionName}/${filename}`,
-        uploaded: object.uploaded.toISOString(),
-        size: object.size,
-      });
     }
-  }
 
-  // Convert map to array and sort
+    cursor = listResponse.truncated ? listResponse.cursor : undefined;
+  } while (cursor);
+
   return Array.from(collectionMap.values()).sort((a, b) =>
     a.name.localeCompare(b.name)
   );
 }
 
-/**
- * POST /upload
- * Upload image and auto-generate collections.json
- */
 async function handleUpload(request, env) {
   const authHeader = request.headers.get('Authorization');
-  const token = env.UPLOAD_TOKEN || 'your-secret-token';
+  const token = env.UPLOAD_TOKEN;
 
-  // Verify auth token
+  if (!token) {
+    return corsResponse(
+      JSON.stringify({ error: 'UPLOAD_TOKEN is not configured on the Worker.' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return corsResponse(
       JSON.stringify({ error: 'Unauthorized' }),
@@ -154,39 +145,37 @@ async function handleUpload(request, env) {
   try {
     const formData = await request.formData();
     const file = formData.get('file');
-    const collection = formData.get('collection') || 'uploads';
+    const collection = sanitizeCollectionName(formData.get('collection') || 'uploads');
 
-    if (!file) {
+    if (!file || typeof file.arrayBuffer !== 'function') {
       return corsResponse(
         JSON.stringify({ error: 'No file provided' }),
         { status: 400, headers: { 'Content-Type': 'application/json' } }
       );
     }
 
-    // Validate file type
     if (!isImageFile(file.name)) {
       return corsResponse(
-        JSON.stringify({ error: 'Invalid file type. Only images allowed.' }),
+        JSON.stringify({ error: 'Invalid file type. Only images are allowed.' }),
         { status: 400, headers: { 'Content-Type': 'application/json' } }
       );
     }
 
-    // Upload to R2
-    const key = `collections/${collection}/${file.name}`;
+    const safeFilename = sanitizeFilename(file.name);
+    const key = `collections/${collection}/${safeFilename}`;
     const buffer = await file.arrayBuffer();
-    
+
     await env.IMAGES.put(key, buffer, {
       httpMetadata: {
-        contentType: file.type,
+        contentType: file.type || getContentType(safeFilename),
         cacheControl: 'public, max-age=31536000',
       },
       metadata: {
-        uploadedBy: 'api',
+        uploadedBy: 'admin',
         uploadedAt: new Date().toISOString(),
       },
     });
 
-    // Regenerate collections.json
     const collections = await generateCollectionsJson(env);
     await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), {
       metadata: { generated: new Date().toISOString() },
@@ -195,13 +184,13 @@ async function handleUpload(request, env) {
     return corsResponse(
       JSON.stringify({
         success: true,
-        message: 'File uploaded and collections updated',
+        message: `${safeFilename} uploaded successfully`,
         file: {
-          name: file.name,
+          name: safeFilename,
           size: file.size,
           type: file.type,
-          url: `https://your-worker-domain.com${key}`,
-          key: key,
+          url: `/collections/${collection}/${encodeURIComponent(safeFilename)}`,
+          key,
         },
       }),
       { status: 201, headers: { 'Content-Type': 'application/json' } }
@@ -215,20 +204,12 @@ async function handleUpload(request, env) {
   }
 }
 
-/**
- * GET /collections/[name]/*
- * Serve image files from R2
- */
 async function handleGetImage(path, env) {
   try {
-    // Remove leading slash
     const key = path.slice(1);
-
     const object = await env.IMAGES.get(key);
 
-    if (!object) {
-      return new Response('Image not found', { status: 404 });
-    }
+    if (!object) return new Response('Image not found', { status: 404 });
 
     return new Response(object.body, {
       headers: {
@@ -243,152 +224,85 @@ async function handleGetImage(path, env) {
   }
 }
 
-/**
- * GET / - Sitemap page
- */
-async function handleIndex(env) {
-  const html = `
-<!DOCTYPE html>
+function handleAdminPage() {
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Blueberry Fruitsy - Image Server API</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: linear-gradient(135deg, #0f0f0f, #1a0f2e);
-            color: #e0e0e0;
-            padding: 40px 20px;
-        }
-        .container { max-width: 900px; margin: 0 auto; }
-        h1 { color: #3b82f6; margin-bottom: 10px; }
-        .api-doc { background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 8px; padding: 20px; margin: 20px 0; }
-        .endpoint { background: rgba(0,0,0,0.3); padding: 15px; border-radius: 6px; margin: 10px 0; font-family: monospace; border-left: 3px solid #3b82f6; }
-        code { background: rgba(0,0,0,0.2); padding: 2px 6px; border-radius: 3px; color: #60a5fa; }
-        ul { margin-left: 20px; }
-        footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid rgba(59,130,246,0.2); color: #707070; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blueberry Fruitsy • Image Upload</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#09090b;color:#f4f4f5;display:flex;align-items:center;justify-content:center;padding:24px}.card{width:min(680px,100%);background:#151518;border:1px solid #2d2d33;border-radius:20px;padding:28px;box-shadow:0 20px 60px #0008}h1{margin:0 0 6px;font-size:28px}.sub{color:#a1a1aa;margin-bottom:26px}.drop{border:2px dashed #4b4b55;border-radius:16px;padding:42px 20px;text-align:center;cursor:pointer;transition:.15s}.drop:hover,.drop.drag{border-color:#8b5cf6;background:#8b5cf611}.drop strong{display:block;font-size:18px;margin-bottom:8px}.drop span{color:#a1a1aa}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:18px 0}label{font-size:13px;color:#a1a1aa;display:block;margin-bottom:7px}input{width:100%;padding:12px;border:1px solid #34343b;border-radius:10px;background:#0d0d0f;color:#fff;font:inherit}button{width:100%;padding:13px;border:0;border-radius:10px;background:#8b5cf6;color:#fff;font-weight:700;font-size:15px;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.files{margin:16px 0;color:#d4d4d8}.status{margin-top:16px;padding:12px;border-radius:10px;background:#0d0d0f;color:#a1a1aa;white-space:pre-wrap}.hint{margin-top:18px;color:#71717a;font-size:12px}.hidden{display:none}@media(max-width:600px){.row{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>🍓 Blueberry Fruitsy - Image Server API</h1>
-        <p>Serverless image hosting with auto-generated metadata</p>
-
-        <div class="api-doc">
-            <h2>📡 Endpoints</h2>
-            
-            <h3>Get Collections Metadata</h3>
-            <div class="endpoint">GET /collections.json</div>
-            <p>Returns auto-generated list of all collections and images</p>
-
-            <h3>Serve Image</h3>
-            <div class="endpoint">GET /collections/[collection-name]/[filename]</div>
-            <p>Access image files directly from R2</p>
-
-            <h3>Upload Image</h3>
-            <div class="endpoint">POST /upload</div>
-            <p>Upload new image and auto-regenerate collections.json</p>
-            <p><strong>Required Header:</strong> <code>Authorization: Bearer YOUR_TOKEN</code></p>
-            <p><strong>Form Data:</strong></p>
-            <ul>
-                <li><code>file</code> - Image file (JPG, PNG, WebP, GIF)</li>
-                <li><code>collection</code> - Collection folder name (optional)</li>
-            </ul>
-        </div>
-
-        <div class="api-doc">
-            <h2>🚀 Features</h2>
-            <ul>
-                <li>✅ Auto-generates collections.json from R2 folder structure</li>
-                <li>✅ Regenerates metadata on every upload</li>
-                <li>✅ Caches collections.json for 1 hour</li>
-                <li>✅ Supports JPG, PNG, WebP, GIF formats</li>
-                <li>✅ Serverless - no server maintenance</li>
-                <li>✅ CORS enabled for cross-origin requests</li>
-            </ul>
-        </div>
-
-        <footer>
-            <p>Made with 💙 by BlueberryF11</p>
-        </footer>
-    </div>
-</body>
-</html>
-  `;
-
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  });
+<div class="card">
+<h1>🍓 Blueberry Fruitsy Image Server</h1>
+<div class="sub">Upload artwork directly to your gallery's image server.</div>
+<div class="row">
+<div><label>Collection</label><input id="collection" value="artwork" placeholder="e.g. artwork"></div>
+<div><label>Upload token</label><input id="token" type="password" placeholder="Your UPLOAD_TOKEN"></div>
+</div>
+<div id="drop" class="drop">
+<strong>Drop artwork here</strong><span>or click to choose one or more image files</span>
+<input id="files" class="hidden" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/bmp,image/svg+xml" multiple>
+</div>
+<div id="fileList" class="files">No files selected.</div>
+<button id="upload" disabled>Upload artwork</button>
+<div id="status" class="status">Ready.</div>
+<div class="hint">Your token is only sent to this server over HTTPS. Do not put it in your GitHub repository.</div>
+</div>
+<script>
+const drop=document.getElementById('drop'),filesInput=document.getElementById('files'),fileList=document.getElementById('fileList'),upload=document.getElementById('upload'),status=document.getElementById('status');
+let files=[];
+function setFiles(list){files=[...list];fileList.textContent=files.length?files.map(f=>`${f.name} (${Math.round(f.size/1024)} KB)`).join('\n'):'No files selected.';upload.disabled=!files.length;}
+drop.onclick=()=>filesInput.click();filesInput.onchange=()=>setFiles(filesInput.files);drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')};drop.ondragleave=()=>drop.classList.remove('drag');drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');setFiles(e.dataTransfer.files)};
+upload.onclick=async()=>{const token=document.getElementById('token').value.trim(),collection=document.getElementById('collection').value.trim()||'artwork';if(!token){status.textContent='Enter your upload token first.';return}upload.disabled=true;let ok=0;for(const file of files){status.textContent=`Uploading ${file.name}...`;const form=new FormData();form.append('file',file);form.append('collection',collection);try{const r=await fetch('/upload',{method:'POST',headers:{Authorization:`Bearer ${token}`},body:form});const data=await r.json();if(!r.ok)throw new Error(data.error||'Upload failed');ok++;}catch(e){status.textContent+=`\n❌ ${file.name}: ${e.message}`;}}status.textContent=`Done. ${ok}/${files.length} file(s) uploaded.`+(ok<files.length?' Check the token and file names.':'');upload.disabled=false;};
+</script>
+</body></html>`;
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-/**
- * Utility: Check if file is an image
- */
+function handleIndex() {
+  return new Response(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blueberry Fruitsy Image Server</title><style>body{font-family:system-ui;background:#09090b;color:#eee;max-width:800px;margin:60px auto;padding:20px}a{color:#a78bfa}code{background:#18181b;padding:3px 6px;border-radius:5px}</style></head><body><h1>🍓 Blueberry Fruitsy Image Server</h1><p>Image API is online.</p><p><a href="/admin">Open the artwork upload dashboard →</a></p><p><a href="/collections.json">View collections.json →</a></p></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+function sanitizeCollectionName(name) {
+  return String(name).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'uploads';
+}
+
+function sanitizeFilename(name) {
+  return String(name).split('\\').pop().split('/').pop().replace(/[^a-zA-Z0-9._-]+/g, '_') || `image-${Date.now()}.png`;
+}
+
 function isImageFile(filename) {
   const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.svg'];
   const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
   return imageExtensions.includes(ext);
 }
 
-/**
- * Utility: Format collection name
- */
+function getContentType(filename) {
+  const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
+  return ({'.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.webp':'image/webp','.gif':'image/gif','.bmp':'image/bmp','.svg':'image/svg+xml'})[ext] || 'application/octet-stream';
+}
+
 function formatCollectionName(name) {
-  return name
-    .replace(/-/g, ' ')
-    .replace(/_/g, ' ')
-    .split(' ')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
+  return name.replace(/-/g, ' ').replace(/_/g, ' ').split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
 
-/**
- * Utility: Format title from filename
- */
 function formatTitle(filename) {
-  return filename
-    .replace(/\.[^.]+$/, '')
-    .replace(/-/g, ' ')
-    .replace(/_/g, ' ')
-    .split(' ')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
+  return filename.replace(/\.[^.]+$/, '').replace(/-/g, ' ').replace(/_/g, ' ').split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
 
-/**
- * Utility: CORS response helper
- */
 function corsResponse(body, options = {}) {
-  const init = {
-    ...options,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Max-Age': '86400',
-      ...options.headers,
-    },
-  };
-
-  if (typeof body === 'string') {
-    return new Response(body, init);
-  }
-
+  const init = {...options, headers: {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Max-Age':'86400',...(options.headers || {})}};
   return new Response(body, init);
 }
 
-/**
- * Regenerate collections.json (called by scheduled event)
- */
 async function regenerateCollectionsJson(env) {
   try {
     const collections = await generateCollectionsJson(env);
-    await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), {
-      metadata: { generated: new Date().toISOString() },
-    });
-    console.log('Collections.json regenerated successfully');
+    await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), { metadata: { generated: new Date().toISOString() } });
   } catch (error) {
     console.error('Error regenerating collections:', error);
   }
