@@ -24,17 +24,18 @@ export default {
 
 async function handleGetCollections(env) {
   try {
+    // Always rebuild directly from the blueberry-images R2 bucket.
     const collections = await generateCollectionsJson(env);
     await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), {
       metadata: { generated: new Date().toISOString() },
     });
     return corsResponse(JSON.stringify(collections, null, 2), {
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' },
     });
   } catch (error) {
     console.error('Error getting collections:', error);
     return corsResponse(JSON.stringify({ error: 'Failed to load collections', details: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' },
+      status: 500, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
     });
   }
 }
@@ -48,14 +49,14 @@ async function generateCollectionsJson(env) {
 
     for (const object of listResponse.objects) {
       const pathParts = object.key.split('/');
-      if (pathParts.length < 3 || pathParts[0] !== 'collections') continue;
+
+      // Only objects in collections/<collection>/<filename> are public gallery artwork.
+      // Files elsewhere in blueberry-images are ignored.
+      if (pathParts.length !== 3 || pathParts[0] !== 'collections') continue;
 
       const collectionName = pathParts[1];
-      const filename = pathParts[pathParts.length - 1];
-      if (!isImageFile(filename) || filename.startsWith('.')) continue;
-
-      // Only images uploaded through this server are published to the gallery.
-      if (object.customMetadata?.uploadedBy !== 'admin') continue;
+      const filename = pathParts[2];
+      if (!collectionName || !filename || filename.startsWith('.') || !isImageFile(filename)) continue;
 
       if (!collectionMap.has(collectionName)) {
         collectionMap.set(collectionName, {
@@ -71,8 +72,8 @@ async function generateCollectionsJson(env) {
         id: object.key,
         filename,
         title: formatTitle(filename),
-        url: `/collections/${collectionName}/${encodeURIComponent(filename)}`,
-        uploaded: object.uploaded.toISOString(),
+        url: `/collections/${encodeURIComponent(collectionName)}/${encodeURIComponent(filename)}`,
+        uploaded: object.uploaded ? object.uploaded.toISOString() : null,
         size: object.size,
       });
     }
@@ -84,7 +85,10 @@ async function generateCollectionsJson(env) {
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((collection) => ({
       ...collection,
-      images: collection.images.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded)),
+      images: collection.images.sort((a, b) => {
+        if (!a.uploaded || !b.uploaded) return a.filename.localeCompare(b.filename);
+        return new Date(b.uploaded) - new Date(a.uploaded);
+      }),
     }));
 }
 
@@ -129,7 +133,7 @@ async function handleUpload(request, env) {
         name: safeFilename,
         size: file.size,
         type: file.type,
-        url: `/collections/${collection}/${encodeURIComponent(safeFilename)}`,
+        url: `/collections/${encodeURIComponent(collection)}/${encodeURIComponent(safeFilename)}`,
         key,
       },
     }), { status: 201, headers: { 'Content-Type': 'application/json' } });
@@ -147,7 +151,7 @@ async function handleGetImage(path, env) {
     return new Response(object.body, {
       headers: {
         'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream',
-        'Cache-Control': 'public, max-age=31536000',
+        'Cache-Control': 'public, max-age=31536000, immutable',
         'Access-Control-Allow-Origin': '*',
       },
     });
