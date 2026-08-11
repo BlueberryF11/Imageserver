@@ -199,3 +199,4 @@ function escapeHtml(value) { return String(value).replace(/[&<>"']/g, c => ({'&'
 function json(data,status=200){return corsResponse(JSON.stringify(data),{status,headers:{'Content-Type':'application/json'}})}
 function corsResponse(body, options={}) { return new Response(body,{...options,headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Max-Age':'86400',...(options.headers||{})}}); }
 async function regenerateCollectionsJson(env) { const collections=await generateCollectionsJson(env); await env.METADATA.put('collections.json',JSON.stringify(collections,null,2),{metadata:{generated:new Date().toISOString()}}); }
+
