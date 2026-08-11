@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker - Blueberry Fruitsy Image Server
- * Auto-generates collections.json when images are uploaded to R2
+ * Auto-generates collections.json from artwork uploaded through this server.
  */
 
 export default {
@@ -24,18 +24,12 @@ export default {
 
 async function handleGetCollections(env) {
   try {
-    const cached = await env.METADATA.get('collections.json');
-    if (cached) {
-      return corsResponse(cached.body, {
-        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' },
-      });
-    }
     const collections = await generateCollectionsJson(env);
     await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), {
       metadata: { generated: new Date().toISOString() },
     });
     return corsResponse(JSON.stringify(collections, null, 2), {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
     });
   } catch (error) {
     console.error('Error getting collections:', error);
@@ -48,36 +42,50 @@ async function handleGetCollections(env) {
 async function generateCollectionsJson(env) {
   const collectionMap = new Map();
   let cursor;
+
   do {
     const listResponse = await env.IMAGES.list(cursor ? { cursor } : {});
+
     for (const object of listResponse.objects) {
       const pathParts = object.key.split('/');
-      if (pathParts.length >= 3 && pathParts[0] === 'collections') {
-        const collectionName = pathParts[1];
-        const filename = pathParts[pathParts.length - 1];
-        if (!isImageFile(filename) || filename.startsWith('.')) continue;
-        if (!collectionMap.has(collectionName)) {
-          collectionMap.set(collectionName, {
-            name: formatCollectionName(collectionName),
-            description: `Collection: ${formatCollectionName(collectionName)}`,
-            path: `collections/${collectionName}`,
-            images: [],
-          });
-        }
-        const collection = collectionMap.get(collectionName);
-        collection.images.push({
-          id: collection.images.length + 1,
-          filename,
-          title: formatTitle(filename),
-          url: `/collections/${collectionName}/${filename}`,
-          uploaded: object.uploaded.toISOString(),
-          size: object.size,
+      if (pathParts.length < 3 || pathParts[0] !== 'collections') continue;
+
+      const collectionName = pathParts[1];
+      const filename = pathParts[pathParts.length - 1];
+      if (!isImageFile(filename) || filename.startsWith('.')) continue;
+
+      // Only images uploaded through this server are published to the gallery.
+      if (object.customMetadata?.uploadedBy !== 'admin') continue;
+
+      if (!collectionMap.has(collectionName)) {
+        collectionMap.set(collectionName, {
+          name: formatCollectionName(collectionName),
+          description: `Collection: ${formatCollectionName(collectionName)}`,
+          path: `collections/${collectionName}`,
+          images: [],
         });
       }
+
+      const collection = collectionMap.get(collectionName);
+      collection.images.push({
+        id: object.key,
+        filename,
+        title: formatTitle(filename),
+        url: `/collections/${collectionName}/${encodeURIComponent(filename)}`,
+        uploaded: object.uploaded.toISOString(),
+        size: object.size,
+      });
     }
+
     cursor = listResponse.truncated ? listResponse.cursor : undefined;
   } while (cursor);
-  return Array.from(collectionMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+  return Array.from(collectionMap.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((collection) => ({
+      ...collection,
+      images: collection.images.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded)),
+    }));
 }
 
 async function handleUpload(request, env) {
@@ -90,26 +98,40 @@ async function handleUpload(request, env) {
   try {
     const formData = await request.formData();
     const file = formData.get('file');
-    const collection = sanitizeCollectionName(formData.get('collection') || 'uploads');
+    const collection = sanitizeCollectionName(formData.get('collection') || 'artwork');
     if (!file || typeof file.arrayBuffer !== 'function') return corsResponse(JSON.stringify({ error: 'No file provided' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     if (!isImageFile(file.name)) return corsResponse(JSON.stringify({ error: 'Invalid file type. Only images are allowed.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
     const safeFilename = sanitizeFilename(file.name);
     const key = `collections/${collection}/${safeFilename}`;
     const buffer = await file.arrayBuffer();
+
     await env.IMAGES.put(key, buffer, {
-      httpMetadata: { contentType: file.type || getContentType(safeFilename), cacheControl: 'public, max-age=31536000' },
-      metadata: { uploadedBy: 'admin', uploadedAt: new Date().toISOString() },
+      httpMetadata: {
+        contentType: file.type || getContentType(safeFilename),
+        cacheControl: 'public, max-age=31536000',
+      },
+      customMetadata: {
+        uploadedBy: 'admin',
+        uploadedAt: new Date().toISOString(),
+      },
     });
 
     const collections = await generateCollectionsJson(env);
     await env.METADATA.put('collections.json', JSON.stringify(collections, null, 2), {
       metadata: { generated: new Date().toISOString() },
     });
+
     return corsResponse(JSON.stringify({
       success: true,
       message: `${safeFilename} uploaded successfully`,
-      file: { name: safeFilename, size: file.size, type: file.type, url: `/collections/${collection}/${encodeURIComponent(safeFilename)}`, key },
+      file: {
+        name: safeFilename,
+        size: file.size,
+        type: file.type,
+        url: `/collections/${collection}/${encodeURIComponent(safeFilename)}`,
+        key,
+      },
     }), { status: 201, headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
     console.error('Upload error:', error);
@@ -119,7 +141,7 @@ async function handleUpload(request, env) {
 
 async function handleGetImage(path, env) {
   try {
-    const key = path.slice(1);
+    const key = decodeURIComponent(path.slice(1));
     const object = await env.IMAGES.get(key);
     if (!object) return new Response('Image not found', { status: 404 });
     return new Response(object.body, {
